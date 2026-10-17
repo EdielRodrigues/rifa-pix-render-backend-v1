@@ -1,0 +1,27 @@
+RIFA PIX RENDER — BACKEND 1.0.0
+
+Coloque os arquivos da pasta backend na raiz do seu repositório GitHub OU mantenha a pasta backend e configure Root Directory = backend no Render.
+Render: New > Web Service > Node > Build: npm install > Start: npm start.
+Se usar render.yaml na raiz, ajuste rootDir para backend.
+
+Variáveis de ambiente obrigatórias:
+MP_ACCESS_TOKEN: token de PRODUÇÃO do Mercado Pago, só no Render.
+MP_WEBHOOK_SECRET: assinatura secreta de notificações Webhooks configurada no Mercado Pago.
+FIREBASE_PROJECT_ID: ID do projeto Firebase.
+FIREBASE_CLIENT_EMAIL: client_email do JSON de conta de serviço.
+FIREBASE_PRIVATE_KEY: private_key do JSON da conta de serviço, com \\n.
+FIREBASE_DATABASE_URL: URL do Realtime Database (https://...firebasedatabase.app).
+PUBLIC_SITE_URL: origem do site do cliente, ex. https://usuario.github.io (sem caminho; várias origens separadas por vírgula).
+PUBLIC_BACKEND_URL: URL do Render, ex. https://rifa-pix.onrender.com.
+
+O serviço expõe GET /, POST /api/pix/criar e POST /api/mercadopago/webhook.
+Mercado Pago: configurar webhook URL PUBLIC_BACKEND_URL/api/mercadopago/webhook e evento Pagamentos; copiar segredo de assinatura para MP_WEBHOOK_SECRET.
+No site do cliente, configurar pagamentos-config.js: window.RIFA_PAYMENT_API_URL = 'https://SEU-SERVICO.onrender.com';
+
+IMPORTANTE:
+- A interface de cliente v15.14 exige adaptação/testes adicionais: não declarar integração concluída antes de testar em produção.
+- Comissões de afiliados NÃO são creditadas automaticamente por este backend; a rotina existente do painel admin deve ser reconciliada antes para evitar crédito duplo.
+- Webhook só confirma após consultar API oficial e validar valor e referência. Retentativas são idempotentes.
+- O backend depende de campos do Firebase usados pela versão fornecida; confira se 'rifa/config/precoNumero' corresponde ao seu banco.
+- Não publicar chaves secretas no GitHub. Não expor regras permissivas do Firebase em produção.
+- Não testado com credenciais reais.

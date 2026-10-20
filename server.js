@@ -17,12 +17,12 @@ try{
 }catch(e){console.error('Firebase:',e.message)}
 const db=()=>admin.database();const sv=()=>admin.database.ServerValue.TIMESTAMP;
 const mpBase='https://api.mercadopago.com';
-async function mp(path,options={}){const r=await fetch(mpBase+path,{...options,headers:{Authorization:'Bearer '+process.env.MP_ACCESS_TOKEN,'Content-Type':'application/json',...(options.headers||{})},signal:AbortSignal.timeout(18000)});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error('Mercado Pago HTTP '+r.status+': '+String(j.message||j.error||'falha').slice(0,160));return j}
+async function mp(path,options={}){const r=await fetch(mpBase+path,{...options,headers:{Authorization:'Bearer '+process.env.MP_ACCESS_TOKEN,'Content-Type':'application/json',...(options.headers||{})},signal:AbortSignal.timeout(35000)});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error('Mercado Pago HTTP '+r.status+': '+String(j.message||j.error||'falha').slice(0,160));return j}
 const cents=v=>Math.round(Number(v)*100);
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.0.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.0.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.1.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.1.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 async function finalize(id,pay){
  const ref=db().ref('rifa/reservas/'+id);const current=(await ref.get()).val();
@@ -46,20 +46,23 @@ app.post('/api/pix/iniciar',user,async(req,res)=>{let id='';let locked=false;try
  const nome=String(req.body?.nome||'').trim().slice(0,150),telefone=String(req.body?.telefone||'').replace(/\D/g,''),cpf=String(req.body?.cpf||'').replace(/\D/g,''),email=String(req.body?.email||'').trim().slice(0,150);
  if(nome.length<3||telefone.length<10||cpf.length!==11||!/^\S+@\S+\.\S+$/.test(email))return res.status(400).json({error:'Informe nome, telefone, CPF e e-mail válido.'});
  if(!nums.length||nums.length>100||nums.some(n=>!Number.isSafeInteger(n)||n<1))return res.status(400).json({error:'Seleção de números inválida'});
+ console.info('Pix iniciar: autenticado; consultando configuração');
  const cfg=(await db().ref('rifa/configPublica/rifa').get()).val()||{};
  if(cfg.vendasAbertas===false)return res.status(409).json({error:'Vendas encerradas'});
  const total=Number(cfg.quantidadeNumeros||100),unit=Number(cfg.precoNumero||cfg.preco||0);
  if(nums.some(n=>n>total)||!Number.isSafeInteger(cents(unit))||cents(unit)<100)return res.status(409).json({error:'Configuração de preço ou números inválida'});
  const valor=cents(unit)*nums.length/100;id='RIFA-'+crypto.randomUUID().replace(/-/g,'').slice(0,20).toUpperCase();const now=Date.now();
  const tx=await db().ref('rifa/numeros').transaction(map=>{map=map||{};if(nums.some(n=>map[n]&&map[n].status!=='livre'))return;for(const n of nums)map[n]={status:'reservado',reservaId:id,ownerUid:req.user.uid,atualizadoEm:now};return map},undefined,false);
- if(!tx.committed)return res.status(409).json({error:'Um dos números já está ocupado. Atualize a lista.'});locked=true;
+ if(!tx.committed)return res.status(409).json({error:'Um dos números já está ocupado. Atualize a lista.'});locked=true;console.info('Pix iniciar: números bloqueados',id);
  const r={reservaId:id,ownerUid:req.user.uid,nome,telefone,cpf,email,numeros:nums,valor,status:'aguardando_pagamento',criadoEm:now,indicadorCodigo:String(req.body?.indicadorCodigo||'').slice(0,80),indicadorCpf:String(req.body?.indicadorCpf||'').replace(/\D/g,'').slice(0,11)};
  await db().ref('rifa/reservas/'+id).set(r);
+ console.info('Pix iniciar: enviando solicitação ao Mercado Pago',id);
  const pay=await mp('/v1/payments',{method:'POST',headers:{'X-Idempotency-Key':crypto.createHash('sha256').update('rifa-pix-'+id).digest('hex')},body:JSON.stringify({transaction_amount:valor,description:'Rifa - pedido '+id,payment_method_id:'pix',external_reference:id,notification_url:process.env.PUBLIC_BACKEND_URL.replace(/\/$/,'')+'/api/mercadopago/webhook',date_of_expiration:new Date(now+30*60*1000).toISOString(),payer:{email,first_name:nome.split(/\s+/)[0],last_name:nome.split(/\s+/).slice(1).join(' ')||'Cliente',identification:{type:'CPF',number:cpf}}})});
+ console.info('Pix iniciar: Mercado Pago respondeu',id,String(pay.id),pay.status);
  await db().ref('rifa/reservas/'+id).update({mpPaymentId:String(pay.id),mpStatus:pay.status,mpCriadoEm:sv()});
  await db().ref('rifa/reservasPorCpf/'+cpf+'/'+id).set({reservaId:id,nome,numeros:nums,valor,status:'aguardando_pagamento',criadoEm:now});
  res.json({reservaId:id,numeros:nums,valor,...qr(pay)});
- }catch(e){console.error('Pix iniciar:',e.message,id);if(locked&&id){const r=(await db().ref('rifa/reservas/'+id).get().catch(()=>({val:()=>null}))).val();if(!r?.mpPaymentId){await db().ref('rifa/numeros').transaction(map=>{map=map||{};for(const [n,x] of Object.entries(map))if(x?.reservaId===id&&x?.status==='reservado')delete map[n];return map},undefined,false).catch(()=>{});await db().ref('rifa/reservas/'+id).remove().catch(()=>{})}}res.status(502).json({error:'Não foi possível criar o Pix. '+e.message.slice(0,180)})}});
+ }catch(e){console.error('Pix iniciar:',e.message,id);if(locked&&id){const r=(await db().ref('rifa/reservas/'+id).get().catch(()=>({val:()=>null}))).val();if(!r?.mpPaymentId && !String(e.message||'').match(/abort|timeout|fetch failed|network/i)){await db().ref('rifa/numeros').transaction(map=>{map=map||{};for(const [n,x] of Object.entries(map))if(x?.reservaId===id&&x?.status==='reservado')delete map[n];return map},undefined,false).catch(()=>{});await db().ref('rifa/reservas/'+id).remove().catch(()=>{})}}res.status(502).json({error:'Não foi possível criar o Pix. '+e.message.slice(0,180)})}});
 // Backwards compatibility: existing pending reservations can still generate a Pix.
 app.post('/api/pix/criar',user,async(req,res)=>{try{const id=String(req.body?.reservaId||'');if(!validId(id))return res.status(400).json({error:'Reserva inválida'});const ref=db().ref('rifa/reservas/'+id),r=(await ref.get()).val();if(!r||r.ownerUid!==req.user.uid)return res.status(404).json({error:'Reserva não encontrada'});if(r.mpPaymentId){const pay=await mp('/v1/payments/'+r.mpPaymentId);return res.json(qr(pay))}return res.status(409).json({error:'Reserva antiga sem cobrança. Contate o administrador.'})}catch(e){console.error('Pix legado:',e.message);res.status(502).json({error:'Falha ao consultar Pix'})}});
 app.get('/api/pix/recuperar/:id',user,async(req,res)=>{try{const id=req.params.id;if(!validId(id))return res.sendStatus(400);const r=(await db().ref('rifa/reservas/'+id).get()).val();if(!r||r.ownerUid!==req.user.uid)return res.sendStatus(404);if(!r.mpPaymentId)return res.status(409).json({error:'Cobrança não encontrada'});const pay=await mp('/v1/payments/'+r.mpPaymentId);res.json({reservaId:id,numeros:r.numeros,valor:r.valor,status:r.status,...qr(pay)})}catch(e){res.status(502).json({error:'Falha ao recuperar cobrança'})}});
@@ -69,4 +72,4 @@ app.post('/api/mercadopago/webhook',async(req,res)=>{if(!verifiedWebhook(req))re
 // Server-side reconciliation works even when the customer closes the app.
 let checking=false;setInterval(async()=>{if(!ready||checking)return;checking=true;try{const snap=await db().ref('rifa/reservas').orderByChild('status').equalTo('aguardando_pagamento').limitToFirst(100).get();for(const [id,r] of Object.entries(snap.val()||{})){if(r.mpPaymentId)try{await reconcile(id,r)}catch(e){console.error('Reconciliar',id,e.message)}}}catch(e){console.error('Reconciliação:',e.message)}finally{checking=false}},60000).unref();
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.1 online'));

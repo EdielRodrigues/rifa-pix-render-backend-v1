@@ -21,14 +21,14 @@ async function mp(path,options={}){const r=await fetch(mpBase+path,{...options,h
 const cents=v=>Math.round(Number(v)*100);
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.1.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.1.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.2.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.2.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 async function finalize(id,pay){
  const ref=db().ref('rifa/reservas/'+id);const current=(await ref.get()).val();
  if(!current||String(current.mpPaymentId)!==String(pay.id)||pay.status!=='approved'||pay.payment_method_id!=='pix'||pay.external_reference!==id||cents(current.valor)!==cents(pay.transaction_amount))return false;
  const tx=await ref.transaction(r=>{if(!r||r.status==='cancelado'||String(r.mpPaymentId)!==String(pay.id))return;if(r.status==='confirmado')return;return {...r,status:'confirmado',mpStatus:'approved',mpConfirmadoEm:Date.now(),atualizadoEm:Date.now()}},undefined,false);
- if(tx.committed){const updates={};if(current.cpf)updates['rifa/reservasPorCpf/'+current.cpf+'/'+id+'/status']='confirmado';for(const n of current.numeros||[])updates['rifa/numeros/'+n]={status:'confirmado',reservaId:id,ownerUid:current.ownerUid,atualizadoEm:Date.now()};await db().ref().update(updates)}
+ if(tx.committed){const updates={};if(current.cpf)updates['rifa/reservasPorCpf/'+current.cpf+'/'+id+'/status']='confirmado';for(const n of current.numeros||[])updates['rifa/numeros/'+n]={status:'confirmado',reservaId:id,ownerUid:current.ownerUid,atualizadoEm:Date.now()};await db().ref().update(updates);console.info('PAGAMENTO CONFIRMADO',id,String(pay.id));}
  return tx.committed||current.status==='confirmado';
 }
 async function expire(id,r,pay){
@@ -69,7 +69,27 @@ app.get('/api/pix/recuperar/:id',user,async(req,res)=>{try{const id=req.params.i
 app.get('/api/pix/status/:id',user,async(req,res)=>{try{const id=req.params.id;if(!validId(id))return res.sendStatus(400);let r=(await db().ref('rifa/reservas/'+id).get()).val();if(!r||r.ownerUid!==req.user.uid)return res.sendStatus(404);if(r.status!=='confirmado'&&r.mpPaymentId)r=await reconcile(id,r);res.json({reservaId:id,status:r.status,mpStatus:r.mpStatus||'',valor:r.valor,numeros:r.numeros})}catch(e){console.error('Pix status:',e.message);res.status(502).json({error:'Consulta temporariamente indisponível'})}});
 function verifiedWebhook(req){const secret=process.env.MP_WEBHOOK_SECRET;if(!secret)return false;const sig=req.headers['x-signature']||'',requestId=req.headers['x-request-id']||'';const ts=/ts=([^,]+)/.exec(sig)?.[1],v1=/v1=([^,]+)/.exec(sig)?.[1],id=String(req.query['data.id']||req.body?.data?.id||'').toLowerCase();if(!ts||!v1||!id||!requestId)return false;const manifest=`id:${id};request-id:${requestId};ts:${ts};`;const hash=crypto.createHmac('sha256',secret).update(manifest).digest('hex');try{return crypto.timingSafeEqual(Buffer.from(hash,'hex'),Buffer.from(v1,'hex'))}catch{return false}}
 app.post('/api/mercadopago/webhook',async(req,res)=>{if(!verifiedWebhook(req))return res.sendStatus(401);const id=String(req.query['data.id']||req.body?.data?.id||'');try{if(!/^\d+$/.test(id))return res.sendStatus(200);const pay=await mp('/v1/payments/'+id);const rid=String(pay.external_reference||'');if(!validId(rid))return res.sendStatus(200);const r=(await db().ref('rifa/reservas/'+rid).get()).val();if(!r||String(r.mpPaymentId)!==id)return res.sendStatus(200);if(pay.status==='approved')await finalize(rid,pay);else await expire(rid,r,pay);res.sendStatus(200)}catch(e){console.error('Webhook:',e.message);res.sendStatus(500)}});
-// Server-side reconciliation works even when the customer closes the app.
-let checking=false;setInterval(async()=>{if(!ready||checking)return;checking=true;try{const snap=await db().ref('rifa/reservas').orderByChild('status').equalTo('aguardando_pagamento').limitToFirst(100).get();for(const [id,r] of Object.entries(snap.val()||{})){if(r.mpPaymentId)try{await reconcile(id,r)}catch(e){console.error('Reconciliar',id,e.message)}}}catch(e){console.error('Reconciliação:',e.message)}finally{checking=false}},60000).unref();
+// Consulta as reservas sem depender de indice Firebase, navegador ou cliente conectado.
+// O Render precisa estar acordado; configure um cron/monitor externo para instancias que dormem.
+let checking=false;
+async function reconcilePending(){
+ if(!ready||checking)return;
+ checking=true;
+ try{
+  const snap=await db().ref('rifa/reservas').get();
+  const all=snap.val()||{};
+  const pending=Object.entries(all).filter(([id,r])=>r&&r.status==='aguardando_pagamento'&&r.mpPaymentId);
+  console.info('Reconciliação: reservas pendentes',pending.length);
+  for(const [id,r] of pending.slice(0,100)){
+   try{
+    const updated=await reconcile(id,r);
+    if(updated?.status==='confirmado')console.info('Reconciliação: aprovado',id,String(r.mpPaymentId));
+   }catch(e){console.error('Reconciliação: falha',id,e.message)}
+  }
+ }catch(e){console.error('Reconciliação geral:',e.message)}
+ finally{checking=false}
+}
+setTimeout(reconcilePending,5000).unref();
+setInterval(reconcilePending,60000).unref();
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.1 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.2 online'));

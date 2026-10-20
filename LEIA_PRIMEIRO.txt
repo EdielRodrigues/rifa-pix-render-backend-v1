@@ -1,21 +1,12 @@
-RIFA PIX V2.2 — CORREÇÃO DA CONFIRMAÇÃO AUTOMÁTICA
+RIFA PIX V2.3 - BACKEND
 
-Atualize SOMENTE server.js no repositório EdielRodrigues/rifa-pix-render-backend-v1.
-Não altere o site nem gere outra cobrança.
+Substitua server.js no repositorio EdielRodrigues/rifa-pix-render-backend-v1 e aguarde deploy Live no Render.
 
-A V2.2 não depende do indice .indexOn para listar reservas pendentes.
-Ao iniciar, e a cada 60 segundos enquanto o Render estiver ativo, consulta o Mercado Pago
-para cobranças pendentes e confirma apenas pagamentos aprovados e validados.
+Mudancas:
+- Novos Pix expiram em 60 minutos.
+- Verificacao do Mercado Pago a cada minuto com logs detalhados.
+- So libera numero depois que Mercado Pago confirma cancelamento/rejeicao; nunca libera se aprovado.
+- Logs explicam divergencias de ID, referencia, metodo e valor.
+- Pix anterior nao deve ser pago novamente.
 
-Verifique /api/diagnostico (version 2.2.0) e os Logs do Render:
-  Reconciliação: reservas pendentes ...
-  PAGAMENTO CONFIRMADO ...
-
-A cobrança anterior é RIFA-C9D4F748057A4FF78495 / 185113351294.
-Não é necessário pagar novamente.
-
-IMPORTANTE: a consulta integral de reservas é solução emergencial; para produção,
-crie indice apropriado, paginação e fila. O servidor gratuito pode dormir; webhook
-precisa estar configurado e um scheduler externo pode ser necessario.
-As regras Firebase .read=true e .write=true são INSEGURAS: não libere vendas
-publicas antes de implantar regras restritivas e testar o painel ADM.
+ATENCAO: nao reabra vendas enquanto as regras do Firebase estiverem publicamente gravaveis. O frontend pode ter cronometro antigo de 30 minutos; atualize-o em etapa posterior.

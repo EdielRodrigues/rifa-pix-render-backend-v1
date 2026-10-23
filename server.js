@@ -22,25 +22,57 @@ const cents=v=>Math.round(Number(v)*100);
 const HOLD_MS=60*60*1000;
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.4.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.4.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.5.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.5.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 async function finalize(id,pay){
- const ref=db().ref('rifa/reservas/'+id);const current=(await ref.get()).val();
+ const ref=db().ref('rifa/reservas/'+id);
+ const current=(await ref.get()).val();
  const reasons=[];
  if(!current)reasons.push('reserva inexistente');
- else{
+ else {
   if(String(current.mpPaymentId)!==String(pay.id))reasons.push('paymentId divergente');
   if(pay.status!=='approved')reasons.push('status nao aprovado');
   if(pay.payment_method_id!=='pix')reasons.push('metodo nao Pix');
   if(String(pay.external_reference||'')!==id)reasons.push('referencia divergente');
   if(cents(current.valor)!==cents(pay.transaction_amount))reasons.push('valor divergente');
  }
- if(reasons.length){console.error('CONFIRMACAO BLOQUEADA',id,'payment',String(pay.id),'motivos:',reasons.join(', '));return false;}
- const tx=await ref.transaction(r=>{if(!r||r.status==='cancelado'||String(r.mpPaymentId)!==String(pay.id))return;if(r.status==='confirmado')return;return {...r,status:'confirmado',mpStatus:'approved',mpConfirmadoEm:Date.now(),atualizadoEm:Date.now()}},undefined,false);
- if(tx.committed){const updates={};if(current.cpf)updates['rifa/reservasPorCpf/'+current.cpf+'/'+id+'/status']='confirmado';for(const n of current.numeros||[])updates['rifa/numeros/'+n]={status:'confirmado',reservaId:id,ownerUid:current.ownerUid,atualizadoEm:Date.now()};await db().ref().update(updates);console.info('PAGAMENTO CONFIRMADO',id,String(pay.id));}
- return tx.committed||current.status==='confirmado';
+ if(reasons.length){
+  console.error('CONFIRMACAO BLOQUEADA',id,'payment',String(pay.id),'motivos:',reasons.join(', '));
+  return false;
+ }
+ // A transacao Firebase pode nao ser aplicada. Registre o resultado e nao confirme
+ // visualmente antes da persistencia efetiva.
+ const now=Date.now();
+ const tx=await ref.transaction(r=>{
+  if(!r||String(r.mpPaymentId)!==String(pay.id)||r.status==='cancelado')return;
+  if(r.status==='confirmado')return r;
+  if(r.status!=='aguardando_pagamento'&&r.status!=='reservado')return;
+  return {...r,status:'confirmado',mpStatus:'approved',mpConfirmadoEm:now,atualizadoEm:now};
+ },undefined,false);
+ const saved=tx.snapshot?.val();
+ console.info('CONFIRMACAO TRANSACAO',id,'committed',tx.committed,'status',saved?.status||'ausente');
+ if(!tx.committed||saved?.status!=='confirmado'){
+  console.error('CONFIRMACAO NAO GRAVADA',id,'statusAtual',saved?.status||'ausente');
+  return false;
+ }
+ // Idempotencia: atualize os indices mesmo quando a reserva ja estava confirmada.
+ const updates={};
+ if(saved.cpf)updates['rifa/reservasPorCpf/'+saved.cpf+'/'+id+'/status']='confirmado';
+ for(const n of saved.numeros||[]){
+  const numberRef=db().ref('rifa/numeros/'+n);
+  const existing=(await numberRef.get()).val();
+  if(existing?.reservaId!==id){
+   console.error('NUMERO DIVERGENTE',id,n);
+   throw Error('Numero vinculado a outra reserva; revisao administrativa necessaria');
+  }
+  updates['rifa/numeros/'+n]={...existing,status:'confirmado',atualizadoEm:now};
+ }
+ await db().ref().update(updates);
+ console.info('PAGAMENTO CONFIRMADO',id,String(pay.id));
+ return true;
 }
+
 async function expire(id,r,pay){
  // Only release a hold when Mercado Pago confirms that payment cannot complete.
  if(!['cancelled','rejected','refunded','charged_back'].includes(pay.status))return;
@@ -119,4 +151,4 @@ async function reconcilePending(){
 setTimeout(reconcilePending,5000).unref();
 setInterval(reconcilePending,60000).unref();
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.4 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.5 online'));

@@ -202,7 +202,7 @@ app.post('/api/admin/reservas/:id/excluir-cancelada',user,async(req,res)=>{
   const updates={};
   if(r.cpf)updates['rifa/reservasPorCpf/'+r.cpf+'/'+id]=null;
   const key=db().ref('rifa/auditoriaAdmin').push().key;
-  updates['rifa/auditoriaAdmin/'+key]={acao:'exclusao_pix_cancelado',reservaId:id,mpPaymentId:String(pay.id),uid:req.user.uid,em:Date.now()};
+  updates['rifa/auditoriaAdmin/'+key]={acao:'exclusao_pix_cancelado',reservaId:id,mpPaymentId:String(pay.id),uid:req.user.uid,em:Date.now(),nome:String(r.nome||''),numeros:Array.isArray(r.numeros)?r.numeros:[],statusAnterior:r.status,valor:Number(r.valor||0)};
   await db().ref().update(updates);
   console.info('RESERVA CANCELADA EXCLUIDA PELO ADM',id);
   res.json({ok:true});

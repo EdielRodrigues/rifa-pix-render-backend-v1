@@ -22,8 +22,8 @@ const cents=v=>Math.round(Number(v)*100);
 const HOLD_MS=60*60*1000;
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.6.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.6.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.7.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.7.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 async function finalize(id,pay){
  const ref=db().ref('rifa/reservas/'+id);
@@ -75,14 +75,37 @@ async function finalize(id,pay){
 }
 
 async function expire(id,r,pay){
- // Only release a hold when Mercado Pago confirms that payment cannot complete.
- if(!['cancelled','rejected','refunded','charged_back'].includes(pay.status))return;
+ if(!['cancelled','rejected','refunded','charged_back'].includes(pay.status))return false;
  const ref=db().ref('rifa/reservas/'+id);
- const tx=await ref.transaction(old=>{if(!old||old.status==='confirmado'||old.status==='cancelado'||String(old.mpPaymentId)!==String(pay.id))return;return {...old,status:'cancelado',mpStatus:pay.status,atualizadoEm:Date.now()}},undefined,false);
- if(!tx.committed)return;
- await db().ref('rifa/numeros').transaction(map=>{map=map||{};for(const n of r.numeros||[])if(map[n]?.reservaId===id&&map[n]?.status==='reservado')delete map[n];return map},undefined,false);
- if(r.cpf)await db().ref('rifa/reservasPorCpf/'+r.cpf+'/'+id+'/status').set('cancelado');
+ const tx=await ref.transaction(old=>{
+  if(old===null)return null; // Firebase Admin SDK pode iniciar transacao com null
+  if(old.status==='confirmado'||old.status==='cancelado'||String(old.mpPaymentId)!==String(pay.id))return;
+  return {...old,status:'cancelado',mpStatus:pay.status,atualizadoEm:Date.now()};
+ },undefined,false);
+ const saved=tx.snapshot?.val();
+ console.info('CANCELAMENTO TRANSACAO',id,'committed',tx.committed,'status',saved?.status||'ausente');
+ if(!tx.committed&&saved?.status!=='cancelado')return false;
+ // Libere apenas os numeros ainda reservados por esta mesma reserva.
+ for(const n of saved?.numeros||r.numeros||[]){
+  const nr=db().ref('rifa/numeros/'+n);
+  const nt=await nr.transaction(v=>{
+   if(v===null)return null;
+   if(v.reservaId!==id||v.status!=='reservado')return;
+   return null;
+  },undefined,false);
+  if(!nt.committed){
+   const remaining=(await nr.get()).val();
+   if(remaining?.reservaId===id&&remaining?.status==='reservado'){
+    console.error('NUMERO NAO LIBERADO',id,n);
+    throw Error('Falha ao liberar numero '+n);
+   }
+  }
+ }
+ if(saved?.cpf||r.cpf)await db().ref('rifa/reservasPorCpf/'+(saved?.cpf||r.cpf)+'/'+id+'/status').set('cancelado');
+ console.info('RESERVA CANCELADA E NUMEROS LIBERADOS',id,String(pay.id));
+ return true;
 }
+
 async function reconcile(id,r){
  if(!r.mpPaymentId){console.warn('Reserva sem pagamento vinculado',id);return r;}
  let pay=await mp('/v1/payments/'+encodeURIComponent(r.mpPaymentId));
@@ -152,4 +175,4 @@ async function reconcilePending(){
 setTimeout(reconcilePending,5000).unref();
 setInterval(reconcilePending,60000).unref();
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.6 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.7 online'));

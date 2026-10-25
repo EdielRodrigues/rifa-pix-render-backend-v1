@@ -22,8 +22,8 @@ const cents=v=>Math.round(Number(v)*100);
 const HOLD_MS=60*60*1000;
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.7.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.7.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.8.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.8.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 async function finalize(id,pay){
  const ref=db().ref('rifa/reservas/'+id);
@@ -174,5 +174,39 @@ async function reconcilePending(){
 }
 setTimeout(reconcilePending,5000).unref();
 setInterval(reconcilePending,60000).unref();
+
+// Exclusao administrativa apenas de reserva Pix JA CANCELADA no Mercado Pago.
+app.post('/api/admin/reservas/:id/excluir-cancelada',user,async(req,res)=>{
+ try{
+  const id=String(req.params.id||'');
+  if(!validId(id))return res.status(400).json({error:'Codigo de reserva invalido'});
+  const adminFlag=(await db().ref('admins/'+req.user.uid).get()).val();
+  if(adminFlag!==true)return res.status(403).json({error:'Apenas administradores autorizados'});
+  const ref=db().ref('rifa/reservas/'+id);
+  const r=(await ref.get()).val();
+  if(!r)return res.status(404).json({error:'Reserva nao encontrada'});
+  if(r.status!=='cancelado'||!r.mpPaymentId)return res.status(409).json({error:'Somente Pix cancelado pode ser excluido'});
+  const pay=await mp('/v1/payments/'+encodeURIComponent(r.mpPaymentId));
+  if(String(pay.id)!==String(r.mpPaymentId)||String(pay.external_reference)!==id||!['cancelled','rejected','refunded','charged_back'].includes(pay.status))return res.status(409).json({error:'Mercado Pago nao confirmou cancelamento'});
+  for(const n of r.numeros||[]){
+   const lock=(await db().ref('rifa/numeros/'+n).get()).val();
+   if(lock?.reservaId===id)return res.status(409).json({error:'Numero ainda vinculado a reserva; libere pelo processo automatico antes de excluir'});
+  }
+  // Exclusao condicional: nao apague reserva cujo status tenha mudado.
+  const tx=await ref.transaction(old=>{
+   if(old===null)return null;
+   if(old.status!=='cancelado'||String(old.mpPaymentId)!==String(pay.id))return;
+   return null;
+  },undefined,false);
+  if(!tx.committed)return res.status(409).json({error:'Reserva alterada; atualize a pagina'});
+  const updates={};
+  if(r.cpf)updates['rifa/reservasPorCpf/'+r.cpf+'/'+id]=null;
+  const key=db().ref('rifa/auditoriaAdmin').push().key;
+  updates['rifa/auditoriaAdmin/'+key]={acao:'exclusao_pix_cancelado',reservaId:id,mpPaymentId:String(pay.id),uid:req.user.uid,em:Date.now()};
+  await db().ref().update(updates);
+  console.info('RESERVA CANCELADA EXCLUIDA PELO ADM',id);
+  res.json({ok:true});
+ }catch(e){console.error('Exclusao cancelada:',e.message);res.status(500).json({error:'Falha ao excluir reserva cancelada'})}
+});
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.7 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.8 online'));

@@ -22,8 +22,8 @@ const cents=v=>Math.round(Number(v)*100);
 const HOLD_MS=60*60*1000;
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.8.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.8.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.9.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.9.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 async function finalize(id,pay){
  const ref=db().ref('rifa/reservas/'+id);
@@ -208,5 +208,36 @@ app.post('/api/admin/reservas/:id/excluir-cancelada',user,async(req,res)=>{
   res.json({ok:true});
  }catch(e){console.error('Exclusao cancelada:',e.message);res.status(500).json({error:'Falha ao excluir reserva cancelada'})}
 });
+// API Payouts: preparação segura. Nenhuma rota desta seção movimenta dinheiro.
+// A habilitação comercial, documentação técnica aprovada e credenciais específicas
+// são pré-requisitos para ativar o envio real. Não reutilizar webhook de recebimentos.
+async function payoutsAdmin(req,res,next){
+ try{
+  const autorizado=(await db().ref('admins/'+req.user.uid).get()).val();
+  if(autorizado!==true)return res.status(403).json({error:'Administrador não autorizado'});
+  next();
+ }catch(e){res.status(503).json({error:'Não foi possível verificar autorização'})}
+}
+app.get('/api/admin/payouts/status',user,payoutsAdmin,(_req,res)=>{
+ res.json({ok:true,enabled:false,mode:'aguardando_habilitacao',realTransfersAvailable:false,
+   message:'API Payouts ainda não autorizada. Nenhum envio automático disponível.'});
+});
+app.post('/api/admin/payouts/preparar',user,payoutsAdmin,async(req,res)=>{
+ try{
+  const cpf=String(req.body?.cpf||'').replace(/\D/g,'');
+  if(!/^\d{11}$/.test(cpf))return res.status(400).json({error:'CPF inválido'});
+  const afiliado=(await db().ref('rifa/afiliadosPorCpf/'+cpf).get()).val();
+  if(!afiliado)return res.status(404).json({error:'Afiliado não encontrado'});
+  const saldo=Number(afiliado.saldoDisponivel||0);
+  if(!Number.isFinite(saldo)||saldo<=0)return res.status(409).json({error:'Sem comissão disponível'});
+  res.json({ok:true,enabled:false,transferCreated:false,
+   destinatario:String(afiliado.nome||''),valor:saldo,
+   pixCadastrado:!!afiliado.pix,
+   message:'Prévia apenas. Nenhuma transferência criada e nenhum saldo alterado.'});
+ }catch(e){console.error('Payout preparar:',e.message);res.status(500).json({error:'Falha ao preparar prévia'})}
+});
+app.post('/api/admin/payouts/enviar',user,payoutsAdmin,(_req,res)=>{
+ res.status(423).json({error:'Envio automático bloqueado até habilitação e integração oficial da API Payouts',enabled:false});
+});
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.8 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.9 online'));

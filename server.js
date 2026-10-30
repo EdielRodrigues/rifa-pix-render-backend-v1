@@ -22,18 +22,19 @@ const cents=v=>Math.round(Number(v)*100);
 const HOLD_MS=60*60*1000;
 const validId=s=>/^[A-Za-z0-9_-]{8,100}$/.test(s);
 async function user(req,res,next){try{const token=/^Bearer (.+)$/.exec(req.headers.authorization||'')?.[1];if(!token)return res.status(401).json({error:'Login necessário'});req.user=await admin.auth().verifyIdToken(token);next()}catch(e){res.status(401).json({error:'Autenticação inválida'})}}
-app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.10.0'}));
-app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.10.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
+app.get('/',(_,res)=>res.json({online:true,service:'Rifa Pix Render',version:'2.11.0'}));
+app.get('/api/diagnostico',(_,res)=>res.json({online:true,version:'2.11.0',mercadoPagoConfigured:!!process.env.MP_ACCESS_TOKEN,firebaseConfigured:ready,siteAutorizado:allowed.has('https://edielrodrigues.github.io'),webhookConfigured:!!process.env.MP_WEBHOOK_SECRET}));
 function qr(pay){return {paymentId:String(pay.id),pixCopiaECola:pay.point_of_interaction?.transaction_data?.qr_code||'',qrCodeBase64:pay.point_of_interaction?.transaction_data?.qr_code_base64||''}}
 
-// Comissões de indicações: crédito atômico por afiliado e por reserva.
+// Crédito idempotente: uma reserva paga só pode gerar um crédito por afiliado.
 async function creditarComissao(reservaId, reserva) {
  const cpf=String(reserva.indicadorCpf||'').replace(/\D/g,'');
  const comprador=String(reserva.cpf||'').replace(/\D/g,'');
  const codigo=String(reserva.indicadorCodigo||'').trim().toUpperCase();
- if(!/^\d{11}$/.test(cpf)||cpf===comprador||!codigo)return {status:'sem_indicacao_valida'};
+ if(!codigo||!/^\d{11}$/.test(cpf))return {status:'sem_indicacao_valida',motivo:'Dados de indicação ausentes na reserva'};
+ if(cpf===comprador)return {status:'sem_indicacao_valida',motivo:'Comprador e afiliado têm o mesmo CPF'};
  const associado=(await db().ref('rifa/codigosAfiliados/'+codigo).get()).val();
- if(String(associado||'')!==cpf)return {status:'codigo_invalido'};
+ if(String(associado||'').replace(/\D/g,'')!==cpf)return {status:'codigo_invalido',motivo:'Código não pertence ao afiliado informado'};
  const cfg=(await db().ref('rifa/configPublica/afiliados').get()).val()||{};
  if(cfg.ativo===false)return {status:'afiliados_desativados'};
  const quantidade=Array.isArray(reserva.numeros)?reserva.numeros.length:0;
@@ -41,26 +42,40 @@ async function creditarComissao(reservaId, reserva) {
  if(!quantidade||!Number.isFinite(unitario)||unitario<=0)return {status:'valor_invalido'};
  const valor=Math.round(quantidade*unitario*100)/100;
  const ref=db().ref('rifa/afiliadosPorCpf/'+cpf);
- const tx=await ref.transaction(a=>{
-  if(!a)return; // cadastro precisa existir
-  if(a.creditosPorReserva?.[reservaId])return; // nunca creditar duas vezes
-  return {...a,
-   saldoDisponivel:Math.round((Number(a.saldoDisponivel||0)+valor)*100)/100,
-   totalGanhos:Math.round((Number(a.totalGanhos||0)+valor)*100)/100,
-   totalIndicacoes:Number(a.totalIndicacoes||0)+quantidade,
-   creditosPorReserva:{...(a.creditosPorReserva||{}),
-    [reservaId]:{valor,quantidade,em:Date.now()}}
-  };
- },undefined,false);
- const credito=tx.snapshot?.val()?.creditosPorReserva?.[reservaId];
- if(!credito)throw Error('Cadastro de afiliado indisponivel');
- // Recria somente o registro ausente, preservando status "paga" e outras alterações.
+ // Leitura explícita evita confundir o cache inicial nulo de uma transação
+ // com um cadastro realmente inexistente.
+ const existente=(await ref.get()).val();
+ if(!existente)throw Error('AFILIADO_NAO_ENCONTRADO');
+ let tx;
+ for(let tentativa=0;tentativa<3;tentativa++){
+  tx=await ref.transaction(a=>{
+   if(!a)return; // Nunca recriar cadastro nem sobrescrever um cadastro apagado.
+   if(a.creditosPorReserva?.[reservaId])return; // Crédito já registrado.
+   return {...a,
+    saldoDisponivel:Math.round((Number(a.saldoDisponivel||0)+valor)*100)/100,
+    totalGanhos:Math.round((Number(a.totalGanhos||0)+valor)*100)/100,
+    totalIndicacoes:Number(a.totalIndicacoes||0)+quantidade,
+    creditosPorReserva:{...(a.creditosPorReserva||{}),[reservaId]:{valor,quantidade,em:Date.now()}}
+   };
+  },undefined,false);
+  if(tx.committed||tx.snapshot?.val()?.creditosPorReserva?.[reservaId])break;
+  // Se o primeiro callback recebeu um cache vazio, a leitura seguinte
+  // permite nova tentativa sem apagar dados nem duplicar créditos.
+  if(!(await ref.get()).exists())throw Error('AFILIADO_REMOVIDO_DURANTE_CREDITO');
+ }
+ const credito=tx?.snapshot?.val()?.creditosPorReserva?.[reservaId];
+ if(!credito)throw Error('TRANSACAO_CREDITO_NAO_APLICADA');
  const comRef=db().ref('rifa/comissoes/'+reservaId);
- await comRef.transaction(atual=>atual||{
-  reservaId,afiliadoCpf:cpf,quantidade:credito.quantidade,valor:credito.valor,
-  status:'disponivel',criadoEm:credito.em
- },undefined,false);
- return {status:tx.committed?'creditada':'ja_creditada',valor:credito.valor,cpf};
+ const comAnterior=(await comRef.get()).val();
+ if(comAnterior&&String(comAnterior.afiliadoCpf)!==cpf)throw Error('CONFLITO_COMISSAO_AFILIADO');
+ if(!comAnterior){
+  await comRef.transaction(atual=>atual||{
+   reservaId,afiliadoCpf:cpf,quantidade:credito.quantidade,valor:credito.valor,
+   status:'disponivel',criadoEm:credito.em
+  },undefined,false);
+ }
+ if(!(await comRef.get()).exists())throw Error('REGISTRO_COMISSAO_NAO_GRAVADO');
+ return {status:tx.committed?'creditada':'ja_creditada',valor:credito.valor,quantidade:credito.quantidade};
 }
 
 async function finalize(id,pay){
@@ -277,7 +292,7 @@ app.post('/api/admin/comissoes/recuperar',user,payoutsAdmin,async(req,res)=>{
   const resultado=await creditarComissao(id,r);
   res.json({ok:true,reservaId:id,...resultado});
  }catch(e){console.error('Recuperar comissao:',e.message);
-  res.status(500).json({error:'Nao foi possivel recuperar a comissao'})}
+  res.status(500).json({error:'Falha interna ao recuperar comissão',codigo: String(e.message||'ERRO_INTERNO').slice(0,90)})}
 });
 
 app.get('/api/admin/payouts/status',user,payoutsAdmin,(_req,res)=>{
@@ -302,4 +317,4 @@ app.post('/api/admin/payouts/enviar',user,payoutsAdmin,(_req,res)=>{
  res.status(423).json({error:'Envio automático bloqueado até habilitação e integração oficial da API Payouts',enabled:false});
 });
 app.use((e,req,res,next)=>res.status(400).json({error:'Requisição inválida ou origem não autorizada'}));
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.10 online'));
+app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('Rifa Pix v2.11 online'));
